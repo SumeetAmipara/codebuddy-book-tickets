@@ -20,6 +20,14 @@ class BookSeatController extends Controller
             'total-seats' => ['required', 'integer', 'min:1', 'max:5']
         ]);
 
+        $emptySeats = Seat::select('id')->where('status', 0)->count();
+
+        if ($emptySeats < $request['total-seats']) {
+            return back()->withError('Only ' . $emptySeats . ' seats are available...!');
+        }
+
+        session()->put('recursion', 1);
+
         return bookSeats($request['seat-name'], $request['total-seats']);
     }
 
@@ -38,37 +46,104 @@ function bookSeats($seatNo, $totalSeats)
     $selectedRow = preg_replace('/[^a-zA-Z]/', '', $seatNo);
     $selectedColumn = intval(preg_replace('/[^0-9]/', '', $seatNo));
 
-    $seats = Seat::get();
-    $sameRow = $seats->where('row_name', $selectedRow)->all();
+    $case1 = Seat::select(DB::raw('COUNT(id) as total, GROUP_CONCAT(CONCAT(row_name, column_no) SEPARATOR ", ") as booked_seats'))
+        ->where('row_name', $selectedRow)
+        ->where(function ($q) use ($selectedColumn, $totalSeats) {
+            $q->where('column_no', '>=', $selectedColumn)
+            ->where('column_no', '<', ($selectedColumn + $totalSeats));
+        })
+        ->where('status', 0)
+        ->first();
 
-    $availableSeats = [];
-    $ids = [];
-    foreach ($sameRow as $row) {
-        $dbSeatNo = $row->row_name . $row->column_no;
-        if (count($availableSeats) == $totalSeats) break;
-        else if ($seatNo == $dbSeatNo && $row->status == 1) {
-            $seatNo = $row->row_name . ($selectedColumn == 10 ? 1 : $selectedColumn+1);
-            session()->put('flag', 1);
-            bookSeats($seatNo, $totalSeats);
-        } else if ($row->status == 0) {
-            if (($seatNo == $dbSeatNo || count($availableSeats)) && count($availableSeats) < $totalSeats) {
-                array_push($availableSeats, $dbSeatNo);
-                array_push($ids, $row->id);
-            }
-        } else {
-            if (count($availableSeats) && count($availableSeats) < $totalSeats /* && $row->column_no == ($selectedColumn - 1) */) {
-                $seatNo = $row->row_name == 'T' ? 'A1' : (++$row->row_name) . 1;
-                session()->put('flag', 1);
-                bookSeats($seatNo, $totalSeats);
-            }
+    if ($case1->total == $totalSeats) {
+        if (session('flag') == 1) {
+            forgetSession('recursion');
+            forgetSession('flag');
+            return back()->withError('Your selected seats are booked. Available suggested seats are ' . $case1->booked_seats);
         }
+        Seat::where('row_name', $selectedRow)
+        ->where(function ($q) use ($selectedColumn, $totalSeats) {
+            $q->where('column_no', '>=', $selectedColumn)
+            ->where('column_no', '<', ($selectedColumn + $totalSeats));
+        })
+        ->where('status', 0)
+        ->update([ 'status' => 1]);
+        forgetSession('recursion');
+        return back()->withSuccess('Booked seats are ' . $case1->booked_seats);
     }
-    if (session('flag') == 1) {
-        session()->forget('flag');
-        return back()->withError('Your selected seats are booked. Suggested seats are ' . implode(', ', $availableSeats));
+
+    $case2 = Seat::select(DB::raw('COUNT(id) as total, GROUP_CONCAT(CONCAT(row_name, column_no) SEPARATOR ", ") as booked_seats'))
+        ->where('row_name', $selectedRow)
+        ->where(function ($q) use ($selectedColumn, $totalSeats) {
+            $q->where('column_no', '<=', $selectedColumn)
+            ->where('column_no', '>', ($selectedColumn - $totalSeats));
+        })
+        ->where('status', 0)
+        ->first();
+
+    if ($case2->total == $totalSeats) {
+        Seat::where('row_name', $selectedRow)
+        ->where(function ($q) use ($selectedColumn, $totalSeats) {
+            $q->where('column_no', '<=', $selectedColumn)
+            ->where('column_no', '>', ($selectedColumn - $totalSeats));
+        })
+        ->where('status', 0)
+        ->update([ 'status' => 1]);
+        forgetSession('recursion');
+        return back()->withSuccess('Booked seats are ' . $case2->booked_seats);
+    }
+
+    $case3 = Seat::select('id', DB::raw('CONCAT(row_name, column_no) as seat_no'), 'column_no')
+        ->where('row_name', $selectedRow)
+        ->where(function ($q) use ($selectedColumn) {
+            $q->where('column_no', '>', $selectedColumn)
+            ->where('column_no', '<=', 10);
+        })
+        ->where('status', 0)
+        ->limit($totalSeats)
+        ->get();
+
+    $case4 = Seat::select('id', DB::raw('CONCAT(row_name, column_no) as seat_no'), 'column_no')
+        ->where('row_name', $selectedRow)
+        ->where(function ($q) use ($selectedColumn) {
+            $q->where('column_no', '>=', 1)
+            ->where('column_no', '<', $selectedColumn);
+        })
+        ->where('status', 0)
+        ->limit($totalSeats)
+        ->get();
+
+    if (count($case3) >= $totalSeats && count($case4) >= $totalSeats) {
+        forgetSession('recursion');
+        if (abs($case3[0]->column_no - $selectedColumn) >= abs($case4[0]->column_no - $selectedColumn)) {
+            $aSeats = $case3->pluck('seat_no')->all();
+            return back()->withError('Your selected seats are booked. Available suggested seats are ' . implode(', ', $aSeats));
+        } else {
+            $aSeats = $case4->pluck('seat_no')->all();
+            return back()->withError('Your selected seats are booked. Available suggested seats are ' . implode(', ', $aSeats));
+        }
+    } else if (count($case3) >= $totalSeats) {
+        forgetSession('recursion');
+        $aSeats = $case3->pluck('seat_no')->all();
+        return back()->withError('Your selected seats are booked. Available suggested seats are ' . implode(', ', $aSeats));
     } else {
-        session()->forget('flag');
-        DB::table('seats')->whereIn('id', $ids)->update(['status' => 1]);
-        return back()->withSuccess('Booked seats are ' . implode(', ', $availableSeats));
+        forgetSession('recursion');
+        $aSeats = $case4->pluck('seat_no')->all();
+        return back()->withError('Your selected seats are booked. Available suggested seats are ' . implode(', ', $aSeats));
     }
+
+    if (session('recursion') <= 20) {
+        session()->increment('recursion');
+        session()->put('flag', 1);
+        $newSeatNo = $selectedRow == 'T' ? 'A' . $selectedColumn : (++$selectedRow) . $selectedColumn;
+        return bookSeats($newSeatNo, $totalSeats);
+    } else {
+        forgetSession('recursion');
+        return back()->withError($totalSeats . ' consecutive seats are not available...!');
+    }
+}
+
+function forgetSession($var)
+{
+    session()->forget($var);
 }
